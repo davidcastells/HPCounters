@@ -1,0 +1,261 @@
+import os
+import shutil
+import py4hw
+import pandas as pd
+import subprocess
+import random
+
+from edalize.vivado_reporting import VivadoReporting
+
+dir = '/tmp/testAlveoU50'
+projectName = 'testAlveoU50'
+
+class TCounterHP(py4hw.Logic):
+    def __init__(self, parent, name, reset, inc, q, carry):
+        super().__init__(parent, name)
+
+        self.addOut('q', q)
+        self.addIn('inc', inc)
+        
+        if not(reset is None):
+            self.addIn('reset', reset)
+
+        if not(carry is None):
+            self.addOut('carry', carry)
+
+        w = q.getWidth()
+        r = self.wires('r', w, 1)
+        t = self.wires('t', w+1, 1)
+
+        py4hw.ConcatenateLSBF(self, 'q', r, q)
+
+        for i in range(w):
+            py4hw.TReg(self, 't{}'.format(i), t[i], r[i], reset=reset)
+
+            if (i == 0):
+                py4hw.Buf(self, 'one', inc, t[i])
+                py4hw.And2(self, 'nt{}'.format(i), r[i], inc, t[i+1])
+            else:
+                #py4hw.And(self, 'and{}'.format(i), r[0:i], t[i])
+                last = r[i]
+
+                for j in range(i):
+                    nr = self.wire('d{}_{}'.format(i,j), last.getWidth())
+
+                    py4hw.Reg(self, 'd{}_{}'.format(i,j), last, nr, reset=reset)
+                    if (j == i-1):
+                        py4hw.And(self, 'nt{}'.format(i), [inc,nr, r[0]], t[i+1])
+                    else:
+                        nnr = self.wire('nt{}_{}'.format(i,j), last.getWidth())
+                        py4hw.And(self, 'nt{}_{}'.format(i,j), [inc, nr, r[i-j-1]], nnr)
+                        last = nnr
+                        
+        if not(carry is None):
+            py4hw.Buf(self, 'carry', t[w], carry)
+
+
+class TCounterHPComposed(py4hw.Logic):
+    def __init__(self, parent, name, reset, inc, q, block_size):
+        import math
+        
+        super().__init__(parent, name)
+        
+        self.addOut('q', q)
+        self.addIn('inc', inc)
+        
+        if not(reset is None):
+            self.addIn('reset', reset)
+
+        w = q.getWidth()
+        nb = int(math.ceil(w/block_size))
+
+        print('Composing', nb, 'blocks of', block_size, 'bits =', nb*block_size)
+                
+        ncarry = inc
+        
+        nq = self.wire('nq', nb*block_size)
+        nq_parts =[]
+        for i in range(nb):
+            carry = self.wire('carry{}'.format(i))
+            q_range = self.wire('qr{}'.format(i), block_size)
+            
+            TCounterHP(self, 'tcount{}'.format(i), reset, ncarry, q_range, carry)
+            nq_parts.append(q_range)
+            ncarry = carry
+            
+        py4hw.ConcatenateLSBF(self, 'nq', nq_parts, nq)
+        py4hw.Range(self, 'q', nq, w-1, 0, q)
+
+
+class AlveoU50(py4hw.HWSystem):
+    def __init__(self):
+        super().__init__(name = 'AlveoU50')
+        clk = self.wire('clk')
+        clockDriver = py4hw.ClockDriver('clk', 50E6, 0, wire=clk)                
+        self.clockDriver = clockDriver
+        
+
+
+def testDesign(bs, req_freq=None):
+
+    n = 256
+
+    if (os.path.exists(dir)):
+        print('removing existing project')
+        shutil.rmtree(dir)
+    
+    os.makedirs(dir)
+        
+    sys = AlveoU50()
+
+    q = sys.wire('q', n)
+    sys.addOut('q', q)
+
+    reset = None # sys.wire('reset')
+    inc = sys.wire('inc')
+
+    py4hw.Constant(sys, 'inc', 1, inc)
+  
+    TCounterHPComposed(sys, 'counter', reset, inc, q, bs)
+
+
+    rtl = py4hw.VerilogGenerator(sys)
+    rtl_code = rtl.getVerilogForHierarchy(noInstanceNumberInTopEntity=True)
+
+    print('finished generating Verilog')
+    with open(dir + '/AlveoU50.v', 'w') as file:
+        file.write(rtl_code)
+
+    clk_freq_txt = 'create_clock -period 1 [get_ports clk]\n'
+
+    with open(dir + '/clk_freq.xdc', 'w') as file:
+        file.write(clk_freq_txt)
+
+
+    tcl_cmd = 'create_project '+projectName+' . -part xcu50-fsvh2104-2-e \n'
+    tcl_cmd += 'set_property board_part xilinx.com:au50:part0:1.3 [current_project]\n'
+    tcl_cmd += 'add_files -norecurse '+dir+'/AlveoU50.v\n'
+    tcl_cmd += 'add_files -fileset constrs_1 '+dir+'/clk_freq.xdc\n'
+    #tcl_cmd += 'add_files -fileset constrs_1 [get_property DIRECTORY [current_project]]/clk_freq.xdc\n'
+
+    tcl_cmd += 'update_compile_order -fileset sources_1\n'
+    # tcl_cmd += 'create_ip -name c_counter_binary -vendor xilinx.com -library ip -version 12.0 -module_name c_counter_binary_0\n'
+    # tcl_cmd += 'set_property CONFIG.Output_Width {{{}}} [get_ips c_counter_binary_0]\n'.format(n)
+    # tcl_cmd += 'generate_target {instantiation_template} [get_files '+dir+'/'+projectName+'.srcs/sources_1/ip/c_counter_binary_0/c_counter_binary_0.xci]\n'
+    #tcl_cmd += 'generate_target all [get_files  '+dir+'/'+projectName+'.srcs/sources_1/ip/c_counter_binary_0/c_counter_binary_0.xci]\n'
+    #tcl_cmd += 'catch { config_ip_cache -export [get_ips -all c_counter_binary_0] }\n'
+    #tcl_cmd += 'export_ip_user_files -of_objects [get_files '+dir+'/'+projectName+'.srcs/sources_1/ip/c_counter_binary_0/c_counter_binary_0.xci] -no_script -sync -force -quiet\n'
+    #tcl_cmd += 'create_ip_run [get_files -of_objects [get_fileset sources_1] '+dir+'/'+projectName+'.srcs/sources_1/ip/c_counter_binary_0/c_counter_binary_0.xci]\n'
+
+    tcl_cmd += 'set_property strategy Performance_Explore [get_runs impl_1]\n'
+
+    tcl_cmd += 'launch_runs impl_1 -jobs 4\n'
+    tcl_cmd += 'wait_on_run impl_1\n'
+        
+    with open(dir + '/create_project.tcl', 'w') as file:
+        file.write(tcl_cmd)
+        
+    cmd = 'vivado -stack 2000 -mode batch -source create_project.tcl'
+    try:
+        result = subprocess.run(cmd, cwd=dir, shell=True, check=True)
+        print("Command executed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+
+    rpt = VivadoReporting.report(dir+ '/'+projectName+'.runs/impl_1/')
+
+    summary = VivadoReporting.report_summary(rpt['resources'], rpt['timing'])
+
+    CLB = summary['lut']
+    FF = summary['reg']
+    Fmax = summary['fmax']['clk']
+    pins = n+1
+    
+    return CLB, FF, pins, Fmax
+    
+def findFmaxDesign(n):
+    # Take care, fmax is reported in MHz, but freq is specified in Hz
+    
+    print('FIND FMAX START n=',n)
+ 
+    FL = 0
+    FH = 2000
+    freq = FH
+   
+    # we start with 50MHz to get an estimate
+    ALM, FF, pins, fmax = testDesign(n, freq*1E6)
+    
+    print('FIND FMAX => FL:',FL, 'FH:', FH, 'freq:', freq, '-> fmax:', fmax)
+
+    FL = fmax 
+    FH = FL*1.1 # 1 GHz is above the maximum possible frequency for our available FPGAs
+    freq = FH
+    
+    last_fmax = [fmax]
+
+    #while ((FL+1) < FH):
+    for i in range(1):
+
+        ALM, FF, pins, fmax = testDesign(n, freq * 1E6)
+
+        print('FIND FMAX => FL:',FL, 'FH:', FH, 'freq:', freq, '-> fmax:', fmax)
+    
+        last_fmax.append(fmax)
+        
+        #if ((len(last_fmax) > 3) and (last_fmax[-1] == last_fmax[-3])):
+        #    # If the last 3 results are equal, stop
+        #    break 
+    
+        if (fmax > freq):
+            FH = fmax * 1.5
+            FL = fmax
+            freq = FH
+        elif (fmax < freq):
+            if (fmax > FL): 
+                FL = fmax
+            else:
+                FH = (max(fmax, FL) + FH) / 2
+                freq = FH
+        
+    fmax = max(last_fmax)
+    
+    print('FIND FMAX STOP => FL:',FL, 'FH:', FH, 'freq:', freq, 'fmax:', fmax)
+    
+    return ALM, FF, pins, fmax   
+
+
+csv_file = 'data_xilinx_tcounter_hp_composed.csv'
+
+if os.path.exists(csv_file):
+    df = pd.read_csv(csv_file, index_col='n')
+else:
+    data = {'n':[], 'ALM' : [], 'FF': [], 'pins':[], 'fmax':[] }
+    df = pd.DataFrame(data)
+    df.set_index('n', inplace=True)
+
+def testAll():
+    obj_set = [256, 128, 86, 64, 52, 43, 37, 32, 29, 26, 24, 22, 20, 19, 18, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+    obj_set = set(obj_set)
+
+    done_set = set(df.index)
+    todo_set = list(obj_set - done_set)
+    todo_set.sort()
+
+    print('Obj set:', obj_set)
+    print('TODO:', todo_set)
+
+    for n in todo_set:
+       print('Testing', n)
+       ALM, FF, pins, fmax = findFmaxDesign(n)
+       #data['n'].append(n)
+       #data['ALM'].append(ALM)
+       #data['FF'].append(FF)
+       #data['pins'].append(pins)
+       #data['fmax'].append(fmax)
+       
+       df.loc[n] = {'ALM': ALM, 'FF': FF, 'pins': pins, 'fmax': fmax}
+       df.to_csv(csv_file)
+
+
+if __name__ == "__main__":
+    testAll()
